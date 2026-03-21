@@ -1,13 +1,113 @@
-from .models import Transaction  # Make sure this import is at the top of your views file
+from django.db import transaction
+from decimal import Decimal
+from django.db.models import F
+from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import render, redirect, get_object_or_404
-from django.contrib import messages
-from django.contrib.auth.models import User
 from django.utils import timezone
+from .models import Transaction  # Make sure this import is at the top of your views file
 from django.conf import settings
+from django.contrib.auth.models import User
 from .models import Group, Invite, GroupJoinRequest, Comment, Event
 from .forms import GroupCreationForm, CommentForm
 from django.urls import reverse
+
+def transfer_funds(request, group_id, event_id):
+    event = get_object_or_404(Event, id=event_id, group__id=group_id)
+    group = event.group
+
+    if request.method != "POST":
+        messages.error(request, "Invalid request method for transferring funds.")
+        return redirect('chipin:group_detail', group_id=group_id)
+
+    if request.user != group.admin:
+        messages.error(request, "Only the group admin can transfer funds.")
+        return redirect('chipin:group_detail', group_id=group_id)
+
+    if event.status == Event.Status.ARCHIVED:
+        messages.error(request, "Funds have already been transferred for this event.")
+        return redirect('chipin:group_detail', group_id=group_id)
+    
+    payers_qs = event.members.select_related("profile")
+    if not payers_qs.exists():
+        payers_qs = group.members.select_related("profile")
+    payers = list(payers_qs)
+
+    # Include admin
+    include_admin_in_payers = True
+    if include_admin_in_payers and group.admin not in payers:
+        payers.append(group.admin)
+
+    if not payers:
+        messages.error(request, "No payers found for this event.")
+        return redirect('chipin:group_detail', group_id=group_id)
+    
+    rough_eligible = [u for u in payers if u.profile.balance > 0]
+
+    if not rough_eligible:
+        messages.error(request, "No members have a positive balance to contribute.")
+        return redirect('chipin:group_detail', group_id=group_id)
+    
+        # Recalculate share using roughly eligible members
+    share = event.total_spend / Decimal(len(rough_eligible))
+
+    # Second pass: final eligibility check
+    final_payers = []
+    excluded = []
+    for u in rough_eligible:
+        if u.profile.balance >= share:
+            final_payers.append(u)
+        else:
+            excluded.append(u)
+    if not final_payers:
+        messages.error(
+            request,
+            "No participants could afford the share amount. Transfer cancelled."
+        )
+        return redirect('chipin:group_detail', group_id=group_id)
+    
+    final_share = event.total_spend / Decimal(len(final_payers))
+
+    with transaction.atomic():
+        # Debit the final eligible payers
+        for u in final_payers:
+            u.profile.balance = F("balance") - final_share
+            u.profile.save(update_fields=["balance"])
+            Transaction.objects.create(
+                user=u,
+                amount=-final_share,
+                created_at=timezone.now(),
+                description=f"Contribution for event '{event.name}'"
+            )
+
+        # Credit admin with the *full* event spend
+        admin_profile = group.admin.profile
+        admin_profile.balance = F("balance") + event.total_spend
+        admin_profile.save(update_fields=["balance"])
+        Transaction.objects.create(
+            user=group.admin,
+            amount=event.total_spend,
+            created_at=timezone.now(),
+            description=f"Funds received for event '{event.name}'"
+        )
+
+        # Archive event
+        event.status = Event.Status.ARCHIVED
+        event.archived_at = timezone.now()
+        event.save(update_fields=["status", "archived_at"])
+
+    msg = (
+        f"Transferred ${event.total_spend} "
+        f"(${final_share:.2f} each) "
+        f"from {len(final_payers)} payer(s)."
+    )
+
+    if excluded:
+        excluded_names = ", ".join(u.username for u in excluded)
+        msg += f" Excluded due to insufficient balance: {excluded_names}."
+    messages.success(request, msg)
+
+    return redirect('chipin:group_detail', group_id=group_id)
 
 @login_required
 def home(request):
@@ -44,6 +144,8 @@ def create_group(request):
 def group_detail(request, group_id, edit_comment_id=None):
     group = get_object_or_404(Group, id=group_id)
     comments = group.comments.all().order_by('-created_at')  # Fetch all comments for the group
+    events = group.events.all()  # Fetch all events associated with the group
+    # Add a new comment or edit an existing comment
     if edit_comment_id: # Fetch the comment to edit, if edit_comment_id is provided
         comment_to_edit = get_object_or_404(Comment, id=edit_comment_id)
         if comment_to_edit.user != request.user:
@@ -63,11 +165,26 @@ def group_detail(request, group_id, edit_comment_id=None):
             return redirect('chipin:group_detail', group_id=group.id)
     else:
         form = CommentForm(instance=comment_to_edit) if comment_to_edit else CommentForm()
+    # Calculate event share for each event and check user eligibility
+    event_share_info = {}
+    for event in events:
+        event_share = event.calculate_share()
+        user_eligible = request.user.profile.max_spend >= event_share
+        user_has_joined = request.user in event.members.all()  # Check if the user has already joined the event
+        event_share_info[event] = {
+            'share': event_share,
+            'eligible': user_eligible,
+            'status': event.status,
+            'joined': user_has_joined
+        }
+    # Return data to the template
     return render(request, 'chipin/group_detail.html', {
         'group': group,
         'comments': comments,
         'form': form,
         'comment_to_edit': comment_to_edit,
+        'events': events,
+        'event_share_info': event_share_info,
     })
 
 @login_required
@@ -200,53 +317,6 @@ def delete_comment(request, comment_id):
     if comment.user == request.user or request.user == comment.group.admin:  # Allow author or group admin to delete
         comment.delete()
     return redirect('chipin:group_detail', group_id=comment.group.id)
-
-@login_required
-def group_detail(request, group_id, edit_comment_id=None):
-    group = get_object_or_404(Group, id=group_id)
-    comments = group.comments.all().order_by('-created_at')  # Fetch all comments for the group
-    events = group.events.all()  # Fetch all events associated with the group
-    # Add a new comment or edit an existing comment
-    if edit_comment_id: # Fetch the comment to edit, if edit_comment_id is provided
-        comment_to_edit = get_object_or_404(Comment, id=edit_comment_id)
-        if comment_to_edit.user != request.user:
-            return redirect('chipin:group_detail', group_id=group.id)
-    else:
-        comment_to_edit = None
-    if request.method == 'POST':
-        if comment_to_edit: # Editing an existing comment
-            form = CommentForm(request.POST, instance=comment_to_edit)
-        else: # Adding a new comment
-            form = CommentForm(request.POST)
-        if form.is_valid():
-            comment = form.save(commit=False)
-            comment.user = request.user
-            comment.group = group
-            comment.save()
-            return redirect('chipin:group_detail', group_id=group.id)
-    else:
-        form = CommentForm(instance=comment_to_edit) if comment_to_edit else CommentForm()
-    # Calculate event share for each event and check user eligibility
-    event_share_info = {}
-    for event in events:
-        event_share = event.calculate_share()
-        user_eligible = request.user.profile.max_spend >= event_share
-        user_has_joined = request.user in event.members.all()  # Check if the user has already joined the event
-        event_share_info[event] = {
-            'share': event_share,
-            'eligible': user_eligible,
-            'status': event.status,
-            'joined': user_has_joined
-        }
-    # Return data to the template
-    return render(request, 'chipin/group_detail.html', {
-        'group': group,
-        'comments': comments,
-        'form': form,
-        'comment_to_edit': comment_to_edit,
-        'events': events,
-        'event_share_info': event_share_info,
-    })
 
 @login_required
 def create_event(request, group_id):

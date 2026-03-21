@@ -81,3 +81,28 @@ class Event(models.Model):
                 return False
         self.status = self.Status.ACTIVE
         return True
+    
+    def calculate_share(self):
+        members_count = self.group.members.count()
+        return 0 if members_count == 0 else self.total_spend / members_count
+    
+    def check_status(self, save=True):
+        if self.status == self.Status.ARCHIVED:
+            return self.status
+        share = self.calculate_share()
+        for member in self.group.members.all():
+            if member.profile.max_spend < share:
+                self.status = self.Status.PENDING
+                if save:
+                    self.save(update_fields=["status"])
+                return self.status
+        self.status = self.Status.ACTIVE
+        if save:
+            self.save(update_fields=["status"])
+        return self.status
+    
+    def archive(self, save=True):
+        self.status = self.Status.ARCHIVED
+        self.archived_at = timezone.now()
+        if save:
+            self.save(update_fields=["status", "archived_at"])
