@@ -1,4 +1,4 @@
-from .models import Transaction  # Make sure this import is at the top of your views file
+from users.models import Transaction  # Make sure this import is at the top of your views file
 from django.db import transaction
 from decimal import Decimal
 from django.db.models import F
