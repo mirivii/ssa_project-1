@@ -65,7 +65,7 @@ class Event(models.Model):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     archived_at = models.DateTimeField(null=True, blank=True)
     group = models.ForeignKey(Group, related_name='events', on_delete=models.CASCADE)
-    members = models.ManyToManyField(User, related_name='event_memberships', blank=True)c
+    members = models.ManyToManyField(User, related_name='event_memberships', blank=True)
     
     def calculate_share(self):
         members_count = self.group.members.count()
